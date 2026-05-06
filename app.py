@@ -35,6 +35,11 @@ def clean_cell(x) -> str:
     return str(x).strip()
 
 
+def base_sku_from_sku(sku: str) -> str:
+    """去掉独立站 slip 里的尺码后缀，例如 NPJ021-L -> NPJ021。"""
+    return re.sub(r"-(S|M|L)$", "", clean_cell(sku), flags=re.I).upper()
+
+
 def find_col(df: pd.DataFrame, candidates: List[str]) -> str:
     """按多个可能列名找列；支持大小写/空格差异。"""
     normalized_cols = {norm_text(c): c for c in df.columns}
@@ -87,17 +92,20 @@ def build_catalog_maps(catalog_df: pd.DataFrame) -> Tuple[Dict[str, dict], Dict[
     name_map = {}
 
     for _, r in catalog_df.iterrows():
-        sku = clean_cell(r.get(sku_col, ""))
+        sku_raw = clean_cell(r.get(sku_col, ""))
         name = clean_cell(r.get(name_col, ""))
         loc = clean_cell(r.get(loc_col, ""))
+        base_sku = base_sku_from_sku(sku_raw)
 
-        if sku:
+        if base_sku:
             # 图册通常是基础 SKU；slip 里通常是 SKU-S/M/L
-            base_sku = re.sub(r"-(S|M|L)$", "", sku.strip(), flags=re.I).upper()
             sku_map[base_sku] = {"product_name": name, "location": loc, "catalog_sku": base_sku}
 
         if name:
-            name_map[norm_text(name)] = {"product_name": name, "location": loc, "catalog_sku": sku}
+            # 如果同名重复，保留第一次出现的，避免后面的空库位覆盖前面的有效库位
+            key = norm_text(name)
+            if key not in name_map:
+                name_map[key] = {"product_name": name, "location": loc, "catalog_sku": base_sku}
 
     return sku_map, name_map
 
@@ -199,7 +207,7 @@ def parse_slip_pdf(uploaded_pdf) -> pd.DataFrame:
                     size = m.group(1).upper()
                 product_name = " ".join(product_parts).strip()
 
-            base_sku = re.sub(r"-(S|M|L)$", "", full_sku, flags=re.I).upper()
+            base_sku = base_sku_from_sku(full_sku)
 
             if product_name or full_sku:
                 rows.append({
@@ -226,24 +234,33 @@ def is_special_item(product_name: str, sku: str, size: str) -> bool:
     return any(k in txt for k in SPECIAL_KEYWORDS)
 
 
+def add_mismatch_row(mismatch_rows: List[dict], slip_sku: str, catalog_sku: str):
+    slip_sku = clean_cell(slip_sku).upper()
+    catalog_sku = clean_cell(catalog_sku).upper()
+    if not slip_sku or not catalog_sku:
+        return
+    if base_sku_from_sku(slip_sku) == base_sku_from_sku(catalog_sku):
+        return
+    mismatch_rows.append({
+        "独立站 Slip SKU": slip_sku,
+        "产品图册 SKU": catalog_sku,
+    })
+
+
 def enrich_and_summarize(details_df: pd.DataFrame, sku_map: Dict[str, dict], name_map: Dict[str, dict]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     匹配规则：
-    1）检货单生成永远 SKU 优先；
-    2）SKU 找不到时，才用款式名兜底；
-    3）如果 Slip 款式名和 Slip SKU 在图册里的对应关系不一致，单独输出 SKU 异常明细。
+    1）检货单生成：SKU 优先；
+    2）SKU 找不到：才用款式名兜底；
+    3）如果同一个 slip 款式名在产品图册里对应另一个 SKU，只在 SKU 异常里显示 SKU 对比，不显示 Order / 款式名。
     """
     enriched = details_df.copy()
     product_names = []
     locations = []
     match_types = []
-    sku_catalog_names = []
-    name_catalog_skus = []
-    issue_notes = []
     mismatch_rows = []
 
     for _, r in enriched.iterrows():
-        order_no = clean_cell(r.get("Order #", ""))
         base_sku = clean_cell(r.get("Base SKU", "")).upper()
         full_sku = clean_cell(r.get("Full SKU", "")).upper()
         slip_name = clean_cell(r.get("Slip Product Name", ""))
@@ -252,73 +269,30 @@ def enrich_and_summarize(details_df: pd.DataFrame, sku_map: Dict[str, dict], nam
 
         sku_match = sku_map.get(base_sku) if base_sku else None
         name_match = name_map.get(name_key) if name_key else None
+        name_catalog_sku = clean_cell(name_match.get("catalog_sku", "")).upper() if name_match else ""
 
-        sku_catalog_name = clean_cell(sku_match.get("product_name", "")) if sku_match else ""
-        name_catalog_sku_raw = clean_cell(name_match.get("catalog_sku", "")) if name_match else ""
-        name_catalog_base_sku = re.sub(r"-(S|M|L)$", "", name_catalog_sku_raw.strip(), flags=re.I).upper() if name_catalog_sku_raw else ""
+        # 只显示 SKU 对 SKU，不显示订单号或款式名
+        if name_catalog_sku and base_sku and base_sku != base_sku_from_sku(name_catalog_sku):
+            add_mismatch_row(mismatch_rows, full_sku or base_sku, name_catalog_sku)
 
-        match = None
-        match_type = "未匹配"
-        issue_note = ""
-
-        # 第一优先级：按 slip 里的 Base SKU 匹配产品图册。
-        # 仓库实际检货以 SKU 对应的图册款式和库位为准。
         if sku_match:
+            # 实际检货永远 SKU 优先
             match = sku_match
-            names_different = bool(slip_name and sku_catalog_name and norm_text(sku_catalog_name) != name_key)
-            # 只有当 Slip 款式名能在图册中找到，且该款式对应的 SKU 与 Slip SKU 不同时，才判定为真正 SKU 不符。
-            # 例如：Slip 写 Citrus Veil / NOF031-L，但图册里 Citrus Veil = NOF030，而 NOF031 = Lady Cherry。
-            if names_different and name_catalog_base_sku and name_catalog_base_sku != base_sku:
-                match_type = "SKU匹配(名称不一致)"
-                issue_note = (
-                    f"Slip上【{slip_name}】的SKU是【{full_sku or base_sku}】，"
-                    f"但产品图册中【{slip_name}】对应SKU是【{name_catalog_base_sku}】；"
-                    f"同时【{base_sku}】在图册中对应【{sku_catalog_name}】。"
-                )
-
-                mismatch_rows.append({
-                    "Order": order_no,
-                    "Slip 款式名": slip_name,
-                    "Slip SKU": full_sku or base_sku,
-                    "Slip Base SKU": base_sku,
-                    "图册中同款式对应 SKU": name_catalog_base_sku,
-                    "SKU 在图册中对应的款式": sku_catalog_name or "图册未找到该SKU",
-                    "检货实际采用": "按 Slip SKU 对应的图册款式/库位",
-                    "异常说明": "Slip 款式名和 Slip SKU 在产品图册里的对应关系不一致",
-                })
-            elif names_different and not (name_key in norm_text(sku_catalog_name) or norm_text(sku_catalog_name) in name_key):
-                match_type = "SKU匹配(名称需检查)"
-                issue_note = (
-                    f"Slip款式名【{slip_name}】和图册中该SKU对应款式【{sku_catalog_name}】不完全一致，"
-                    "但未在图册中找到同名款式，暂不判定为SKU不符。"
-                )
-            else:
-                match_type = "SKU匹配"
-        elif name_match:
-            match = name_match
-            match_type = "款式名兜底匹配(SKU未找到)"
-            issue_note = (
-                f"Slip SKU【{full_sku or base_sku}】在产品图册中未找到，"
-                f"已用款式名【{slip_name}】兜底匹配。"
-            )
-            mismatch_rows.append({
-                "Order": order_no,
-                "Slip 款式名": slip_name,
-                "Slip SKU": full_sku or base_sku,
-                "Slip Base SKU": base_sku,
-                "图册中同款式对应 SKU": name_catalog_base_sku or "图册未找到该款式名",
-                "SKU 在图册中对应的款式": "图册未找到该SKU",
-                "检货实际采用": "按款式名兜底匹配",
-                "异常说明": "Slip SKU 在产品图册中未找到",
-            })
-
-        if match:
-            product_name = match.get("product_name") or slip_name
+            product_name = match.get("product_name") or slip_name or base_sku
             location = match.get("location") or ""
+            match_type = "SKU匹配" if not name_catalog_sku or base_sku == base_sku_from_sku(name_catalog_sku) else "SKU匹配(SKU不一致)"
+        elif name_match:
+            # SKU 找不到时，才用款式名兜底
+            match = name_match
+            product_name = match.get("product_name") or slip_name or base_sku
+            location = match.get("location") or ""
+            match_type = "款式名兜底(SKU未在图册找到)"
+            if name_catalog_sku and base_sku:
+                add_mismatch_row(mismatch_rows, full_sku or base_sku, name_catalog_sku)
         else:
             product_name = slip_name or base_sku
             location = ""
-            issue_note = issue_note or "Slip SKU 和款式名都没有在产品图册中匹配到。"
+            match_type = "未匹配"
 
         if not location:
             location = "无库位(特殊款)" if is_special_item(product_name, base_sku, size) else "未识别库位"
@@ -326,18 +300,12 @@ def enrich_and_summarize(details_df: pd.DataFrame, sku_map: Dict[str, dict], nam
         product_names.append(product_name)
         locations.append(location)
         match_types.append(match_type)
-        sku_catalog_names.append(sku_catalog_name)
-        name_catalog_skus.append(name_catalog_base_sku)
-        issue_notes.append(issue_note)
 
     enriched["Product Name"] = product_names
     enriched["库位"] = locations
     enriched["匹配方式"] = match_types
-    enriched["SKU在图册中对应款式"] = sku_catalog_names
-    enriched["图册中同款式对应SKU"] = name_catalog_skus
-    enriched["异常说明"] = issue_notes
 
-    # 主检货单：和示例第四个文件一致
+    # 主检货单：库位 / Product Name / S / M / L / Total
     summary_rows = []
     grouped = enriched.groupby(["库位", "Product Name"], dropna=False)
     for (loc, pname), g in grouped:
@@ -351,15 +319,14 @@ def enrich_and_summarize(details_df: pd.DataFrame, sku_map: Dict[str, dict], nam
     if summary.empty:
         summary = pd.DataFrame(columns=["库位", "Product Name", "S", "M", "L", "Total"])
 
-    mismatch_df = pd.DataFrame(mismatch_rows)
-    if mismatch_df.empty:
-        mismatch_df = pd.DataFrame(columns=[
-            "Order", "Slip 款式名", "Slip SKU", "Slip Base SKU", "图册中同款式对应 SKU",
-            "SKU 在图册中对应的款式", "检货实际采用", "异常说明"
-        ])
-
     summary = summary.sort_values(by="库位", key=lambda col: col.map(location_sort_key)).reset_index(drop=True)
+
+    mismatch_df = pd.DataFrame(mismatch_rows, columns=["独立站 Slip SKU", "产品图册 SKU"])
+    if not mismatch_df.empty:
+        mismatch_df = mismatch_df.drop_duplicates().reset_index(drop=True)
+
     return summary, enriched, mismatch_df
+
 
 def location_sort_key(loc: str):
     s = clean_cell(loc)
@@ -380,7 +347,8 @@ def make_excel(summary_df: pd.DataFrame, detail_df: pd.DataFrame, mismatch_df: p
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="检货单")
         detail_df.to_excel(writer, index=False, sheet_name="订单明细")
-        mismatch_df.to_excel(writer, index=False, sheet_name="SKU异常明细")
+        if mismatch_df is not None and not mismatch_df.empty:
+            mismatch_df.to_excel(writer, index=False, sheet_name="SKU异常")
 
         workbook = writer.book
         header_fmt = workbook.add_format({
@@ -421,21 +389,17 @@ def make_excel(summary_df: pd.DataFrame, detail_df: pd.DataFrame, mismatch_df: p
         ws2.set_column("D:E", 14)
         ws2.set_column("F:G", 10)
         ws2.set_column("H:I", 26)
-        ws2.set_column("J:J", 14)
+        ws2.set_column("J:J", 16)
         ws2.freeze_panes(1, 0)
         ws2.autofilter(0, 0, max(len(detail_df), 1), len(detail_df.columns) - 1)
 
-        ws3 = writer.sheets["SKU异常明细"]
-        for col_num, value in enumerate(mismatch_df.columns.values):
-            ws3.write(0, col_num, value, header_fmt)
-        ws3.set_column("A:A", 14)
-        ws3.set_column("B:B", 26)
-        ws3.set_column("C:D", 16)
-        ws3.set_column("E:F", 30)
-        ws3.set_column("G:G", 28)
-        ws3.set_column("H:H", 42)
-        ws3.freeze_panes(1, 0)
-        ws3.autofilter(0, 0, max(len(mismatch_df), 1), len(mismatch_df.columns) - 1)
+        if mismatch_df is not None and not mismatch_df.empty:
+            ws3 = writer.sheets["SKU异常"]
+            for col_num, value in enumerate(mismatch_df.columns.values):
+                ws3.write(0, col_num, value, header_fmt)
+            ws3.set_column("A:B", 22, cell_fmt)
+            ws3.freeze_panes(1, 0)
+            ws3.autofilter(0, 0, max(len(mismatch_df), 1), len(mismatch_df.columns) - 1)
 
     output.seek(0)
     return output.getvalue()
@@ -444,9 +408,9 @@ def make_excel(summary_df: pd.DataFrame, detail_df: pd.DataFrame, mismatch_df: p
 # =========================
 # Streamlit 页面
 # =========================
-st.set_page_config(page_title="独立站 Slip 检货单生成器", layout="wide")
+st.set_page_config(page_title="独立站 Slip 检货单生成器", page_icon="💅", layout="wide")
 st.title("独立站 Slip 检货单生成器")
-st.caption("上传产品图册 + 独立站 Packing Slip PDF，自动生成：库位 / Product Name / S / M / L / Total。匹配规则：SKU 优先，款式名兜底；若 SKU 和款式名对应关系不一致，会单独显示 SKU 异常明细。")
+st.caption("上传产品图册 + 独立站 Packing Slip PDF，自动生成：库位 / Product Name / S / M / L / Total。匹配规则：SKU 优先，款式名兜底。")
 
 with st.sidebar:
     st.header("上传文件")
@@ -470,8 +434,8 @@ if catalog_file and slip_file:
         col4.metric("SKU异常", len(mismatch_df))
 
         if not mismatch_df.empty:
-            st.warning("发现 SKU / 款式名对应关系异常：检货单仍然优先按照 Slip SKU 对应的产品图册款式和库位生成。")
-            st.subheader("SKU 异常明细")
+            st.subheader("SKU异常")
+            st.caption("这里只显示独立站 Slip SKU 和产品图册 SKU 哪些对不上。")
             st.dataframe(mismatch_df, use_container_width=True, hide_index=True)
 
         st.subheader("检货单预览")
